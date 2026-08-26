@@ -3,15 +3,19 @@ export * as SessionCompaction from "./compaction.js"
 import { LLMClient, AIError, LLMEvent, Message, type LLMRequest } from "@opencode-ai/ai"
 import type { StreamOptions } from "@opencode-ai/ai/route"
 import { SessionError } from "@opencode-ai/schema/session-error"
-import { Context, Effect, Layer, Stream } from "effect"
+import { Cause, Context, Effect, Exit, Layer, Stream } from "effect"
 import { Bus } from "../bus.js"
+import { Database } from "../database/database.js"
 import { makeLocationNode } from "@opencode-ai/util/effect/app-node"
 import { llmClient } from "../effect/app-node-platform.js"
 import { SessionEvent } from "./event.js"
+import type { MessageDecodeError } from "./error.js"
+import { SessionInbox } from "./inbox.js"
 import type { SessionMessage } from "./message.js"
 import { SessionModelRequest } from "./model-request.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
+import { SessionStore } from "./store.js"
 import { toSessionError } from "./to-session-error.js"
 import { Token } from "../util/token.js"
 import { SessionUsage } from "./usage.js"
@@ -66,6 +70,8 @@ export type Draft = {
 
 type Dependencies = {
   readonly bus: Bus.Interface
+  readonly db: Database.Interface["db"]
+  readonly store: SessionStore.Interface
   readonly llm: {
     readonly stream: (request: LLMRequest, options?: StreamOptions) => Stream.Stream<LLMEvent, AIError>
   }
@@ -81,13 +87,6 @@ export type AutoInput = {
 
 type RequiredInput = Pick<AutoInput, "messages" | "resolved">
 
-export type ManualInput = {
-  readonly session: SessionSchema.Info
-  readonly messages: readonly SessionMessage.Info[]
-  readonly inputID: SessionMessage.ID
-  readonly started?: boolean
-}
-
 type Plan = {
   readonly session: SessionSchema.Info
   readonly resolved: SessionRunnerModel.Resolved
@@ -95,7 +94,6 @@ type Plan = {
   readonly prompt: string
   readonly recent: string
   readonly inputID?: SessionMessage.ID
-  readonly started?: boolean
 }
 
 export type Outcome =
@@ -106,7 +104,11 @@ export interface Interface extends State.Transformable<Draft> {
   readonly enabled: () => boolean
   readonly required: (input: RequiredInput) => boolean
   readonly compact: (input: AutoInput) => Effect.Effect<Outcome>
-  readonly compactManual: (input: ManualInput) => Effect.Effect<Outcome>
+  /** Consumes and settles the next eligible manual compaction, if any. */
+  readonly runPending: (
+    sessionID: SessionSchema.ID,
+    promotable: SessionInbox.Promotable,
+  ) => Effect.Effect<boolean, MessageDecodeError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionCompaction") {}
@@ -258,14 +260,6 @@ const make = (dependencies: Dependencies) => {
     return { status: "failed" as const, error: input.error }
   })
   const execute = Effect.fn("SessionCompaction.execute")(function* (plan: Plan) {
-    if (!plan.started)
-      yield* dependencies.bus.publish(SessionEvent.Compaction.Started, {
-        sessionID: plan.session.id,
-        reason: plan.reason,
-        recent: plan.recent,
-        inputID: plan.inputID,
-      })
-
     const chunks: string[] = []
     let failure: SessionError.Error | undefined
     let usage: SessionUsage.Recorded | undefined
@@ -344,13 +338,19 @@ const make = (dependencies: Dependencies) => {
   })
   const compact = Effect.fn("SessionCompaction.compact")(function* (input: AutoInput) {
     const content = planContent(input.messages, state.get().tokens)
-    if (content)
+    if (content) {
+      yield* dependencies.bus.publish(SessionEvent.Compaction.Started, {
+        sessionID: input.session.id,
+        reason: "auto",
+        recent: content.recent,
+      })
       return yield* execute({
         session: input.session,
         resolved: input.resolved,
         reason: "auto",
         ...content,
       })
+    }
     return yield* failed({
       sessionID: input.session.id,
       reason: "auto",
@@ -378,34 +378,62 @@ const make = (dependencies: Dependencies) => {
     if (used <= 0) return false
     return used >= promptCeiling
   }
-  const compactManual = Effect.fn("SessionCompaction.compactManual")(function* (input: ManualInput) {
-    const content = planContent(input.messages, state.get().tokens)
-    if (!content)
-      return yield* failed({
-        sessionID: input.session.id,
-        reason: "manual",
-        error: { type: "compaction.unavailable", message: "Nothing to compact yet" },
-        inputID: input.inputID,
-      })
-    const resolved = yield* dependencies.models.resolve(input.session).pipe(
-      Effect.catch((cause) =>
-        failed({
-          sessionID: input.session.id,
+  const runPending = Effect.fn("SessionCompaction.runPending")(function* (
+    sessionID: SessionSchema.ID,
+    promotable: SessionInbox.Promotable,
+  ) {
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        // Delivery and start share a transaction; the inbox lock does not cover model work.
+        const pending = yield* SessionInbox.serialized(
+          sessionID,
+          Effect.gen(function* () {
+            const selected = yield* SessionInbox.nextPromotable(dependencies.db, sessionID, promotable)
+            if (selected?.type !== "compaction") return
+            yield* dependencies.bus.publishAll([
+              [SessionEvent.InboxDelivered, { sessionID, inboxID: selected.id }],
+              [SessionEvent.Compaction.Started, { sessionID, reason: "manual", recent: "", inputID: selected.id }],
+            ])
+            return selected
+          }),
+        )
+        if (!pending) return false
+        const session = yield* dependencies.store.get(sessionID)
+        if (!session) return yield* Effect.die(new Error(`Session not found: ${sessionID}`))
+        const compacted = yield* restore(
+          Effect.gen(function* () {
+            const content = planContent(yield* dependencies.store.context(sessionID), state.get().tokens)
+            if (!content)
+              return yield* failed({
+                sessionID,
+                reason: "manual",
+                error: { type: "compaction.unavailable", message: "Nothing to compact yet" },
+                inputID: pending.id,
+              })
+            const resolved = yield* dependencies.models
+              .resolve(session)
+              .pipe(
+                Effect.catch((cause) =>
+                  failed({ sessionID, reason: "manual", error: toSessionError(cause), inputID: pending.id }),
+                ),
+              )
+            if ("status" in resolved) return resolved
+            return yield* execute({ session, resolved, reason: "manual", inputID: pending.id, ...content })
+          }),
+        ).pipe(Effect.exit)
+        // A handled failed summary still consumes the control so later input can run.
+        if (Exit.isSuccess(compacted)) return true
+        yield* failed({
+          sessionID,
           reason: "manual",
-          error: toSessionError(cause),
-          inputID: input.inputID,
-        }),
-      ),
+          error: Cause.hasInterruptsOnly(compacted.cause)
+            ? { type: "aborted", message: "Compaction cancelled" }
+            : { type: "compaction.failed", message: Cause.pretty(compacted.cause) },
+          inputID: pending.id,
+        })
+        return yield* Effect.failCause(compacted.cause)
+      }),
     )
-    if ("status" in resolved) return resolved
-    return yield* execute({
-      session: input.session,
-      resolved,
-      reason: "manual",
-      inputID: input.inputID,
-      started: input.started,
-      ...content,
-    })
   })
   return Service.of({
     transform: state.transform,
@@ -413,7 +441,7 @@ const make = (dependencies: Dependencies) => {
     enabled: () => state.get().auto,
     required,
     compact,
-    compactManual,
+    runPending,
   })
 }
 
@@ -421,15 +449,17 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const bus = yield* Bus.Service
+    const db = (yield* Database.Service).db
+    const store = yield* SessionStore.Service
     const llm = yield* LLMClient.Service
     const models = yield* SessionRunnerModel.Service
     const modelRequests = yield* SessionModelRequest.Service
-    return make({ bus, llm, models, modelRequests })
+    return make({ bus, db, store, llm, models, modelRequests })
   }),
 )
 
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Bus.node, llmClient, SessionRunnerModel.node, SessionModelRequest.node],
+  deps: [Bus.node, Database.node, SessionStore.node, llmClient, SessionRunnerModel.node, SessionModelRequest.node],
 })

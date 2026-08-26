@@ -1,7 +1,7 @@
 export * as SessionRunnerLLM from "./llm.js"
 
 import { Message } from "@opencode-ai/ai"
-import { Cause, Config, Effect, Exit, FiberMap, Layer, Pull, Schedule } from "effect"
+import { Config, Effect, FiberMap, Layer, Pull, Schedule } from "effect"
 import { Database } from "../../database/database.js"
 import { Bus } from "../../bus.js"
 import { InstructionState } from "../instruction-state.js"
@@ -86,7 +86,7 @@ const layer = Layer.effect(
       yield* settleStaleToolCalls(input.sessionID)
       while (true) {
         // Scope gates input promotion, not a between-step control that is next in line.
-        if (yield* runPendingCompaction(input.sessionID, "input")) {
+        if (yield* compaction.runPending(input.sessionID, "input")) {
           force = false
           continue
         }
@@ -118,7 +118,7 @@ const layer = Layer.effect(
       let next = continuation
       let first = true
       while (true) {
-        if (yield* runPendingCompaction(sessionID, "steer")) continue
+        if (yield* compaction.runPending(sessionID, "steer")) continue
         if (yield* runPendingMove(sessionID, "steer")) return DrainResult.Moved({ continuation: next })
         if (!first && !next && !(yield* SessionInbox.has(db, sessionID, "steer"))) return DrainResult.Complete()
         const result = yield* runStep(sessionID, promotable, step)
@@ -223,50 +223,6 @@ const layer = Layer.effect(
       }
     })
 
-    const runPendingCompaction = Effect.fn("SessionRunner.runPendingCompaction")(function* (
-      sessionID: SessionSchema.ID,
-      promotable: SessionInbox.Promotable,
-    ) {
-      return yield* Effect.uninterruptibleMask((restore) =>
-        Effect.gen(function* () {
-          const pending = yield* SessionInbox.serialized(
-            sessionID,
-            Effect.gen(function* () {
-              const selected = yield* SessionInbox.nextPromotable(db, sessionID, promotable)
-              if (selected?.type !== "compaction") return
-              yield* bus.publishAll([
-                [SessionEvent.InboxDelivered, { sessionID, inboxID: selected.id }],
-                [SessionEvent.Compaction.Started, { sessionID, reason: "manual", recent: "", inputID: selected.id }],
-              ])
-              return selected
-            }),
-          )
-          if (pending?.type !== "compaction") return false
-          const session = yield* getSession(sessionID)
-          const compacted = yield* restore(
-            Effect.gen(function* () {
-              return yield* compaction.compactManual({
-                session,
-                messages: yield* store.context(sessionID),
-                inputID: pending.id,
-                started: true,
-              })
-            }),
-          ).pipe(Effect.exit)
-          if (Exit.isSuccess(compacted)) return true
-          yield* bus.publish(SessionEvent.Compaction.Failed, {
-            sessionID,
-            reason: "manual",
-            error: Cause.hasInterruptsOnly(compacted.cause)
-              ? { type: "aborted", message: "Compaction cancelled" }
-              : { type: "compaction.failed", message: Cause.pretty(compacted.cause) },
-            inputID: pending.id,
-          })
-          return yield* Effect.failCause(compacted.cause)
-        }),
-      )
-    })
-
     const runPendingMove = Effect.fn("SessionRunner.runPendingMove")(function* (
       sessionID: SessionSchema.ID,
       promotable: SessionInbox.Promotable,
@@ -310,12 +266,6 @@ const layer = Layer.effect(
           })
         }
       }
-    })
-
-    const getSession = Effect.fn("SessionRunner.getSession")(function* (sessionID: SessionSchema.ID) {
-      const session = yield* store.get(sessionID)
-      if (!session) return yield* Effect.die(new Error(`Session not found: ${sessionID}`))
-      return session
     })
 
     return Service.of({ drain })

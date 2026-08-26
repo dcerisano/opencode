@@ -9,6 +9,7 @@ import { Bus } from "@opencode-ai/core/bus"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { SessionCompaction } from "@opencode-ai/core/session/compaction"
 import { SessionEvent } from "@opencode-ai/core/session/event"
+import { SessionInbox } from "@opencode-ai/core/session/inbox"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
@@ -190,7 +191,7 @@ it.effect("auto compaction reserves a buffer below the prompt ceiling", () =>
   }),
 )
 
-/** Seeds the global project plus one session row, returning the projected session. */
+/** Seeds the global project plus one session row for durable inbox tests. */
 const insertSession = (id: Session.ID, overrides?: Partial<typeof SessionTable.$inferInsert>) =>
   Effect.gen(function* () {
     const db = (yield* Database.Service).db
@@ -213,11 +214,23 @@ const insertSession = (id: Session.ID, overrides?: Partial<typeof SessionTable.$
       })
       .run()
       .pipe(Effect.orDie)
-    const store = yield* SessionStore.Service
-    return yield* store
-      .get(id)
-      .pipe(Effect.flatMap((session) => (session ? Effect.succeed(session) : Effect.die(`session missing: ${id}`))))
   })
+
+const admitCompaction = Effect.fnUntraced(function* (sessionID: Session.ID, payload: SessionInbox.UserPayload) {
+  const db = (yield* Database.Service).db
+  const bus = yield* Bus.Service
+  yield* SessionInbox.admit(db, bus, {
+    id: SessionMessage.ID.create(),
+    sessionID,
+    item: { type: "user", payload, delivery: "steer" },
+  })
+  yield* SessionInbox.promote(db, bus, sessionID, "input")
+  return yield* SessionInbox.admitCompaction(db, bus, {
+    id: SessionMessage.ID.create(),
+    sessionID,
+    delivery: "steer",
+  })
+})
 
 it.effect("manual compaction summarizes short context instead of no-op", () =>
   Effect.gen(function* () {
@@ -228,9 +241,10 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
     const store = yield* SessionStore.Service
     const sessionID = Session.ID.make("ses_manual_compaction")
     const parentID = Session.ID.make("ses_manual_compaction_parent")
-    const userMessage = {
-      id: SessionMessage.ID.create(),
-      type: "user" as const,
+    yield* insertSession(sessionID, { parent_id: parentID })
+    yield* compaction.transform((draft) => draft.configure({ auto: false }))
+    expect(yield* compaction.runPending(sessionID, "input")).toBe(false)
+    const pending = yield* admitCompaction(sessionID, {
       text: "Manual compaction should include this short conversation.",
       skills: [
         {
@@ -239,21 +253,15 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
           text: "Use Effect services and generators.",
         },
       ],
-      time: { created: DateTime.makeUnsafe(0) },
-    }
-    const session = yield* insertSession(sessionID, { parent_id: parentID })
+    })
 
     const delta = yield* bus
       .subscribe(SessionEvent.Compaction.Delta)
       .pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped)
     yield* Effect.yieldNow
-    expect(
-      yield* compaction.compactManual({
-        session,
-        messages: [userMessage],
-        inputID: SessionMessage.ID.make("msg_manual_compaction"),
-      }),
-    ).toEqual({ status: "completed" })
+    expect(yield* compaction.runPending(sessionID, "input")).toBe(true)
+    expect(yield* SessionInbox.find(db, pending.id)).toBeUndefined()
+    expect(yield* compaction.runPending(sessionID, "input")).toBe(false)
     expect(Array.from(yield* Fiber.join(delta)).map((event) => event.data.text)).toEqual(["manual summary"])
 
     expect(requests).toHaveLength(1)
@@ -271,7 +279,14 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
     expect(JSON.stringify(requests[0]?.messages)).toContain("Manual compaction should include this short conversation.")
     expect(JSON.stringify(requests[0]?.messages)).toContain("Use Effect services and generators.")
     expect(yield* store.context(sessionID)).toMatchObject([
-      { type: "compaction", reason: "manual", summary: "manual summary", recent: "" },
+      {
+        id: pending.id,
+        type: "compaction",
+        status: "completed",
+        reason: "manual",
+        summary: "manual summary",
+        recent: "",
+      },
     ])
     expect(yield* store.get(sessionID)).toMatchObject({
       cost: 0.0000233,
@@ -286,6 +301,10 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
         .all()
         .pipe(Effect.orDie),
     ).toEqual([
+      { type: Bus.versionedType(SessionEvent.InboxEnqueued.type, 1) },
+      { type: Bus.versionedType(SessionEvent.InboxDelivered.type, 1) },
+      { type: Bus.versionedType(SessionEvent.InboxEnqueued.type, 1) },
+      { type: Bus.versionedType(SessionEvent.InboxDelivered.type, 1) },
       { type: Bus.versionedType(SessionEvent.Compaction.Started.type, 1) },
       { type: Bus.versionedType(SessionEvent.UsageRecorded.type, 1) },
       { type: Bus.versionedType(SessionEvent.Compaction.Ended.type, 1) },
@@ -297,26 +316,16 @@ it.effect("forked session compaction reuses the fork root prompt cache key", () 
   Effect.gen(function* () {
     requests = []
     const compaction = yield* SessionCompaction.Service
+    const store = yield* SessionStore.Service
     const sessionID = Session.ID.make("ses_fork_compaction")
     const rootID = Session.ID.make("ses_fork_compaction_root")
-    const session = yield* insertSession(sessionID, {
+    yield* insertSession(sessionID, {
       fork_session_id: rootID,
       fork_boundary: { type: "before", messageID: SessionMessage.ID.create() },
     })
-    expect(
-      yield* compaction.compactManual({
-        session,
-        messages: [
-          {
-            id: SessionMessage.ID.create(),
-            type: "user",
-            text: "Summarize the forked conversation.",
-            time: { created: DateTime.makeUnsafe(0) },
-          },
-        ],
-        inputID: SessionMessage.ID.make("msg_fork_compaction"),
-      }),
-    ).toEqual({ status: "completed" })
+    yield* admitCompaction(sessionID, { text: "Summarize the forked conversation." })
+    expect(yield* compaction.runPending(sessionID, "input")).toBe(true)
+    expect(yield* store.context(sessionID)).toMatchObject([{ type: "compaction", status: "completed" }])
 
     expect(requests).toHaveLength(1)
     expect(requests[0]?.promptCacheKey).toBe(rootID)
@@ -327,6 +336,7 @@ it.effect("keeps session context hooks away from compaction requests", () =>
   Effect.gen(function* () {
     requests = []
     const compaction = yield* SessionCompaction.Service
+    const store = yield* SessionStore.Service
     // Context hooks shape the agent conversation; compaction is not part of it,
     // so it opts out and the transcript passes through unchanged.
     const hooks = yield* PluginHooks.Service
@@ -335,21 +345,11 @@ it.effect("keeps session context hooks away from compaction requests", () =>
         event.system.push(SystemPart.make("Injected conversation context"))
       }),
     )
-    const session = yield* insertSession(Session.ID.make("ses_hook_compaction"))
-    expect(
-      yield* compaction.compactManual({
-        session,
-        messages: [
-          {
-            id: SessionMessage.ID.create(),
-            type: "user",
-            text: "Summarize this conversation.",
-            time: { created: DateTime.makeUnsafe(0) },
-          },
-        ],
-        inputID: SessionMessage.ID.make("msg_hook_compaction"),
-      }),
-    ).toEqual({ status: "completed" })
+    const sessionID = Session.ID.make("ses_hook_compaction")
+    yield* insertSession(sessionID)
+    yield* admitCompaction(sessionID, { text: "Summarize this conversation." })
+    expect(yield* compaction.runPending(sessionID, "input")).toBe(true)
+    expect(yield* store.context(sessionID)).toMatchObject([{ type: "compaction", status: "completed" }])
 
     expect(requests).toHaveLength(1)
     expect(requests[0]?.system).toEqual([])
