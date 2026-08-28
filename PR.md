@@ -1,6 +1,6 @@
 ### Issue for this PR
 
-References #36043, complements #PR_A.
+Closes #36043
 
 ### Type of change
 
@@ -25,7 +25,10 @@ Because the projection lives in the shared `session-ui` package, web and
 desktop also inherit the cheaper `project()` as a free performance win, even
 though their per-token rendering is not the freeze described in #36043.
 
-Complements #PR_A (delta coalescing); together they fully fix the TUI freeze.
+Complementary server-side counterpart: the V2 durable-store PR (drops
+per-delta writes from the projector; `.ended` writes the authoritative text
+once). Together they remove O(n²) from both ends of the stream — the client
+render path here, the server write path there.
 
 ### How did you verify your code works?
 
