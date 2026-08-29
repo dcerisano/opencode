@@ -234,12 +234,13 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
           )
         })
       },
-      "session.next.text.delta": (event) => {
-        return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
-          const match = latestText(draft, event.data.textID)
-          if (match) match.text += event.data.delta
-        })
-      },
+      // Text deltas are not written to the durable store: `session.next.text.ended`
+      // carries the full authoritative text and overwrites the part in one write,
+      // so per-delta accumulation would only add O(n²) string concat plus a DB
+      // SELECT and full-row UPDATE for every token. The durable row is read for
+      // context only after the step ends, so nothing observes the intermediate
+      // state. Live clients stream the deltas directly from the event stream.
+      "session.next.text.delta": () => Effect.void,
       "session.next.text.ended": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           const match = latestText(draft, event.data.textID)
@@ -355,12 +356,11 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
           )
         })
       },
-      "session.next.reasoning.delta": (event) => {
-        return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
-          const match = latestReasoning(draft, event.data.reasoningID)
-          if (match) match.text += event.data.delta
-        })
-      },
+      // Reasoning deltas are not written to the durable store: `session.next.reasoning.ended`
+      // carries the full authoritative text and finalizes the part in one write, so
+      // per-delta accumulation would only add O(n²) concat plus a DB SELECT and
+      // full-row UPDATE for every token. Live clients stream deltas directly.
+      "session.next.reasoning.delta": () => Effect.void,
       "session.next.reasoning.ended": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           const match = latestReasoning(draft, event.data.reasoningID)

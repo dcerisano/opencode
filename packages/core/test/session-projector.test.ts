@@ -564,4 +564,92 @@ describe("SessionProjector", () => {
       ])
     }),
   )
+
+  it.effect("writes only the authoritative text from .ended, not per-delta accumulation", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: Project.ID.global,
+          slug: "test",
+          directory: "/project",
+          title: "test",
+          version: "test",
+        })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionMessageTable)
+        .values([assistantRow(SessionMessage.ID.make("msg_assistant_deltas"), 0)])
+        .run()
+        .pipe(Effect.orDie)
+
+      const service = yield* EventV2.Service
+      const assistantMessageID = SessionMessage.ID.make("msg_assistant_deltas")
+      yield* service.publish(SessionEvent.Text.Started, {
+        sessionID,
+        assistantMessageID,
+        timestamp: created,
+        textID: "text-stream",
+      })
+      for (const [i, fragment] of ["a", "b", "c"].entries()) {
+        yield* service.publish(SessionEvent.Text.Delta, {
+          sessionID,
+          assistantMessageID,
+          timestamp: DateTime.makeUnsafe(i + 1),
+          textID: "text-stream",
+          delta: fragment,
+        })
+      }
+
+      const midStream = yield* db
+        .select()
+        .from(SessionMessageTable)
+        .where(eq(SessionMessageTable.id, assistantMessageID))
+        .get()
+        .pipe(Effect.orDie)
+      const midMessage = Schema.decodeUnknownSync(SessionMessage.Message)({
+        ...midStream!.data,
+        id: midStream!.id,
+        type: midStream!.type,
+      })
+      expect(midMessage.type).toBe("assistant")
+      if (midMessage.type !== "assistant") throw new Error("unreachable")
+      expect(midMessage.content).toEqual([
+        SessionMessage.AssistantText.make({ type: "text", id: "text-stream", text: "" }),
+      ])
+
+      yield* service.publish(SessionEvent.Text.Ended, {
+        sessionID,
+        assistantMessageID,
+        timestamp: DateTime.makeUnsafe(4),
+        textID: "text-stream",
+        text: "abc",
+      })
+
+      const rows = yield* db
+        .select()
+        .from(SessionMessageTable)
+        .where(eq(SessionMessageTable.id, assistantMessageID))
+        .get()
+        .pipe(Effect.orDie)
+      const message = Schema.decodeUnknownSync(SessionMessage.Message)({
+        ...rows!.data,
+        id: rows!.id,
+        type: rows!.type,
+      })
+      expect(message.type).toBe("assistant")
+      if (message.type !== "assistant") throw new Error("unreachable")
+      expect(message.content).toEqual([
+        SessionMessage.AssistantText.make({ type: "text", id: "text-stream", text: "abc" }),
+      ])
+    }),
+  )
 })
