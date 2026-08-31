@@ -28,25 +28,22 @@ export function memory(state: MemoryState): Adapter {
     getCurrentAssistant() {
       return Effect.sync(() => {
         const index = latestAssistantIndex()
-        if (index < 0) return
         const assistant = state.messages[index]
-        return assistant?.type === "assistant" && !assistant.time.completed ? assistant : undefined
+        return index < 0 || assistant?.type !== "assistant" || assistant.time.completed ? undefined : assistant
       })
     },
     getAssistant(messageID) {
       return Effect.sync(() => {
         const index = assistantIndex(messageID)
-        if (index < 0) return
         const assistant = state.messages[index]
-        return assistant?.type === "assistant" ? assistant : undefined
+        return index < 0 || assistant?.type !== "assistant" ? undefined : assistant
       })
     },
     getCurrentShell(callID) {
       return Effect.sync(() => {
         const index = activeShellIndex(callID)
-        if (index < 0) return
         const shell = state.messages[index]
-        return shell?.type === "shell" ? shell : undefined
+        return index < 0 || shell?.type !== "shell" ? undefined : shell
       })
     },
     updateAssistant(assistant) {
