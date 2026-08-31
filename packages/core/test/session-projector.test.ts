@@ -182,7 +182,7 @@ describe("SessionProjector", () => {
         sessionID,
         limit: 1,
         order: "asc",
-        cursor: { id: firstPage[0]!.id, direction: "next" },
+        cursor: { id: firstPage[0].id, direction: "next" },
       })
       expect(secondPage.map((message) => (message.type === "user" ? message.text : message.type))).toEqual(["second"])
       expect(
@@ -190,7 +190,7 @@ describe("SessionProjector", () => {
           sessionID,
           limit: 1,
           order: "asc",
-          cursor: { id: secondPage[0]!.id, direction: "previous" },
+          cursor: { id: secondPage[0].id, direction: "previous" },
         })).map((message) => (message.type === "user" ? message.text : message.type)),
       ).toEqual(["first"])
       expect(
@@ -227,7 +227,10 @@ describe("SessionProjector", () => {
         prompt: Prompt.make({ text: "promote me" }),
         delivery: "steer",
       })
-      if (!admitted) return yield* Effect.die("Prompt admission failed")
+      if (!admitted) {
+        yield* Effect.die("Prompt admission failed")
+        return
+      }
 
       const event = yield* events.publish(SessionEvent.Prompted, {
         sessionID,
