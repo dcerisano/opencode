@@ -1,4 +1,4 @@
-import { marked, type Tokens } from "marked"
+import { marked, type Token, type Tokens } from "marked"
 import remend from "remend"
 import { completedProjection } from "./markdown-projection"
 
@@ -22,6 +22,10 @@ function refs(text: string) {
 
 function language(value: string | undefined) {
   return value?.trim().split(/\s+/, 1)[0] || undefined
+}
+
+function isCodeToken(token: Token): token is Tokens.Code {
+  return token.type === "code"
 }
 
 function openCode(raw: string) {
@@ -64,10 +68,9 @@ export function stream(text: string, live: boolean): Block[] {
     const token = tokens[index]
     if (!token || token.type === "space") continue
     let raw = token.raw
-    while (tokens[index + 1]?.type === "space" && index + 1 < tail) raw += tokens[++index]!.raw
-    if (token.type === "code") {
-      const code = token as Tokens.Code
-      result.push({ raw, src: code.text, mode: "code", language: language(code.lang), complete: true })
+    while (tokens[index + 1]?.type === "space" && index + 1 < tail) raw += tokens[++index].raw
+    if (isCodeToken(token)) {
+      result.push({ raw, src: token.text, mode: "code", language: language(token.lang), complete: true })
       continue
     }
     result.push({ raw, src: raw, mode: "full" })
@@ -77,12 +80,11 @@ export function stream(text: string, live: boolean): Block[] {
     .slice(tail)
     .map((token) => token.raw)
     .join("")
-  if (last.type !== "code") return [...result, { raw, src: heal(raw), mode: "live" }]
+  if (!isCodeToken(last)) return [...result, { raw, src: heal(raw), mode: "live" }]
 
-  const code = last as Tokens.Code
-  if (!open(code.raw))
-    return [...result, { raw, src: code.text, mode: "code", language: language(code.lang), complete: true }]
-  return [...result, { raw, src: openCode(code.raw), mode: "code", language: language(code.lang) }]
+  if (!open(last.raw))
+    return [...result, { raw, src: last.text, mode: "code", language: language(last.lang), complete: true }]
+  return [...result, { raw, src: openCode(last.raw), mode: "code", language: language(last.lang) }]
 }
 
 // Streaming projection bounds the work done per delta. Re-lexing the whole
