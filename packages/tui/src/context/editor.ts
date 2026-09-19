@@ -4,6 +4,7 @@ import { Option, Schema, SchemaGetter } from "effect"
 import { isRecord } from "../util/record"
 import { useTuiPaths } from "./runtime"
 import { createSimpleContext } from "./helper"
+import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { editorIntegration } from "../editor"
 
 const MCP_PROTOCOL_VERSION = "2025-11-25"
@@ -225,7 +226,7 @@ export const { use: useEditorContext, provider: EditorContextProvider } = create
         request("initialize", {
           protocolVersion: MCP_PROTOCOL_VERSION,
           capabilities: {},
-          clientInfo: { name: "opencode", version: "0.0.0" },
+          clientInfo: { name: "opencode", version: InstallationVersion },
         })
       })
 
