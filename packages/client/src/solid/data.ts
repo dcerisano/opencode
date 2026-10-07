@@ -50,6 +50,7 @@ import {
 import { createStore, produce, reconcile } from "solid-js/store"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
 import { batch, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
+import { createDeltaBuffer } from "./delta-buffer"
 
 export type DataSessionStatus = "idle" | "running"
 type OpenCodeEventMap = { [Type in OpenCodeEvent["type"]]: Extract<OpenCodeEvent, { type: Type }> }
@@ -485,6 +486,39 @@ export function createData(config: CreateDataInput) {
     },
   }
 
+  // Coalesce high-frequency stream deltas into at most one store write per
+  // scheduled flush. The apply closure re-searches the target message/part at
+  // flush time so it never holds a stale store reference. Compaction deltas
+  // carry no message/part identity, so they resolve the running compaction from
+  // the session's current messages at apply time.
+  const deltaBuffer = createDeltaBuffer(
+    (flush) => setTimeout(flush, 32),
+    (pending) => {
+      if (pending.kind === "text") {
+        message.editText(pending.sessionID, pending.messageID, (text) => {
+          text.text += pending.delta
+        })
+        return
+      }
+      if (pending.kind === "reasoning") {
+        message.editReasoning(pending.sessionID, pending.messageID, (reasoning) => {
+          reasoning.text += pending.delta
+        })
+        return
+      }
+      if (pending.kind === "tool") {
+        message.editTool(pending.sessionID, pending.messageID, pending.partID, (tool) => {
+          if (tool.state.status === "streaming") tool.state.input += pending.delta
+        })
+        return
+      }
+      message.update(pending.sessionID, (draft) => {
+        const current = message.compaction(draft)
+        if (current?.status === "running") current.summary += pending.delta
+      })
+    },
+  )
+
   function index(sessionID: string) {
     const existing = messageIndex.get(sessionID)
     if (existing) return existing
@@ -640,6 +674,7 @@ export function createData(config: CreateDataInput) {
         sync.complete(`session.message:${event.data.sessionID}`)
         return
       case "session.deleted":
+        deltaBuffer.drop((pending) => pending.sessionID === event.data.sessionID)
         removeSession(event.data.sessionID)
         return
       case "session.usage.updated":
@@ -907,11 +942,16 @@ export function createData(config: CreateDataInput) {
         })
         return
       case "session.text.delta":
-        message.editText(event.data.sessionID, event.data.assistantMessageID, (text) => {
-          text.text += event.data.delta
+        deltaBuffer.push({
+          kind: "text",
+          sessionID: event.data.sessionID,
+          messageID: event.data.assistantMessageID,
+          partID: `text:${event.data.ordinal}`,
+          delta: event.data.delta,
         })
         return
       case "session.text.ended":
+        deltaBuffer.drain()
         message.editText(event.data.sessionID, event.data.assistantMessageID, (text) => {
           text.text = event.data.text
         })
@@ -928,11 +968,16 @@ export function createData(config: CreateDataInput) {
         })
         return
       case "session.tool.input.delta":
-        message.editTool(event.data.sessionID, event.data.assistantMessageID, event.data.id, (tool) => {
-          if (tool.state.status === "streaming") tool.state.input += event.data.delta
+        deltaBuffer.push({
+          kind: "tool",
+          sessionID: event.data.sessionID,
+          messageID: event.data.assistantMessageID,
+          partID: event.data.id,
+          delta: event.data.delta,
         })
         return
       case "session.tool.input.ended":
+        deltaBuffer.drain()
         message.editTool(event.data.sessionID, event.data.assistantMessageID, event.data.id, (tool) => {
           if (tool.state.status === "streaming") tool.state.input = event.data.text
         })
@@ -990,11 +1035,16 @@ export function createData(config: CreateDataInput) {
         })
         return
       case "session.reasoning.delta":
-        message.editReasoning(event.data.sessionID, event.data.assistantMessageID, (reasoning) => {
-          reasoning.text += event.data.delta
+        deltaBuffer.push({
+          kind: "reasoning",
+          sessionID: event.data.sessionID,
+          messageID: event.data.assistantMessageID,
+          partID: `reasoning:${event.data.ordinal}`,
+          delta: event.data.delta,
         })
         return
       case "session.reasoning.ended":
+        deltaBuffer.drain()
         message.editReasoning(event.data.sessionID, event.data.assistantMessageID, (reasoning) => {
           reasoning.text = event.data.text
           reasoning.time = { created: reasoning.time?.created ?? event.created, completed: event.created }
@@ -1074,6 +1124,8 @@ export function createData(config: CreateDataInput) {
           setStore("session", "info", event.data.sessionID, "revert", undefined)
         return
       case "session.revert.committed":
+        // Buffered pre-revert deltas are superseded by the reverted transcript.
+        deltaBuffer.drop((pending) => pending.sessionID === event.data.sessionID)
         if (store.session.info[event.data.sessionID]) {
           setStore("session", "info", event.data.sessionID, "revert", undefined)
         }
@@ -1091,12 +1143,16 @@ export function createData(config: CreateDataInput) {
         })
         return
       case "session.compaction.delta":
-        message.update(event.data.sessionID, (draft) => {
-          const current = message.compaction(draft)
-          if (current?.status === "running") current.summary += event.data.text
+        deltaBuffer.push({
+          kind: "compaction",
+          sessionID: event.data.sessionID,
+          messageID: "",
+          partID: "",
+          delta: event.data.text,
         })
         return
       case "session.compaction.ended":
+        deltaBuffer.drain()
         message.update(event.data.sessionID, (draft, index) => {
           const position = draft.findLastIndex((item) => item.type === "compaction" && item.status === "running")
           const current = draft[position]
@@ -1945,6 +2001,7 @@ export function createData(config: CreateDataInput) {
       handleEvent(details)
     }),
   )
+  onCleanup(() => deltaBuffer.drain())
 
   return result
 }
